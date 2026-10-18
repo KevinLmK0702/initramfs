@@ -1,0 +1,3 @@
+# The init binary is generated from init.c by the Makefile in this repo;
+# only the source is tracked (same layout as the xaga reference initramfs).
+/root/init
