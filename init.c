@@ -19,6 +19,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/reboot.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
@@ -350,6 +351,213 @@ static void probe_block_devices(void)
  * the whole display chain, so the next read-back says whether the missing
  * piece is the panel link, the CRTC, or just the modeset.
  */
+/* ------------------------------------------------------------------ *
+ * MT6833 connectivity (CONSYS + MT6631 A-die) bring-up
+ *
+ * The vendor stack drives this from two Android daemons:
+ *   wmt_loader   -> /dev/wmtdetect : chip detect, CONN hardware init
+ *   wmt_launcher -> /dev/stpwmt    : WMT config name, STP mode, the LPBK
+ *                                    power-on request, and a responder
+ *                                    loop that answers srh_rom_patch with
+ *                                    the ROM-patch descriptors
+ * Both are reimplemented here so bring-up needs neither a shell, nor
+ * python, nor a mounted rootfs.  The ioctl numbers are exactly the ones
+ * the built-in drivers define (wmt_detect.h and wmt_dev.c).
+ * ------------------------------------------------------------------ */
+
+#define WMT_DETECT_IOC_MAGIC            'w'
+#define COMBO_IOCTL_SET_CHIP_ID         _IOW(WMT_DETECT_IOC_MAGIC, 1, int)
+#define COMBO_IOCTL_GET_SOC_CHIP_ID     _IOR(WMT_DETECT_IOC_MAGIC, 3, int)
+#define COMBO_IOCTL_DO_MODULE_INIT      _IOR(WMT_DETECT_IOC_MAGIC, 4, int)
+#define COMBO_IOCTL_GET_ADIE_CHIP_ID    _IOR(WMT_DETECT_IOC_MAGIC, 9, int)
+#define COMBO_IOCTL_CONNSYS_SOC_HW_INIT _IOR(WMT_DETECT_IOC_MAGIC, 10, int)
+
+#define WMT_IOC_MAGIC                   0xa0
+#define WMT_IOCTL_SET_STP_MODE          _IOW(WMT_IOC_MAGIC, 5, int)
+#define WMT_IOCTL_SET_ROM_PATCH_INFO    _IOW(WMT_IOC_MAGIC, 31, char *)
+#define WMT_IOCTL_WMT_CFG_NAME          _IOWR(WMT_IOC_MAGIC, 21, char *)
+
+/*
+ * What WMT_IOCTL_SET_ROM_PATCH_INFO expects: a 4-byte type, the 4-byte load
+ * address exactly as it appears at offset 0x18..0x20 of the
+ * soc2_2_ram_*_hdr.bin header, then the file name.
+ */
+struct wmt_rom_patch_info {
+	unsigned int type;
+	char addr[4];
+	char name[256];
+};
+
+static const char *const conn_ram_patch[] = { "mcu", "bt", "wifi" };
+
+static int wmt_rom_patch_info(int fd, const char *dir)
+{
+	unsigned char hdr[32];
+	char path[160];
+	int i, ok = 0;
+
+	for (i = 0; i < (int)(sizeof(conn_ram_patch) / sizeof(conn_ram_patch[0])); i++) {
+		struct wmt_rom_patch_info info;
+		const unsigned char *p;
+		int f, n;
+
+		snprintf(path, sizeof(path), "%s/soc2_2_ram_%s_1_1_hdr.bin",
+			 dir, conn_ram_patch[i]);
+		f = open(path, O_RDONLY);
+		if (f < 0) {
+			printf("  [conn] %s: %s\n", path, strerror(errno));
+			continue;
+		}
+		n = read(f, hdr, sizeof(hdr));
+		close(f);
+		if (n < 32) {
+			printf("  [conn] %s: short header\n", path);
+			continue;
+		}
+
+		/* descriptor sits at 0x18: byte 7 is the type, 1..3 the address */
+		p = hdr + 0x18;
+		memset(&info, 0, sizeof(info));
+		info.type = p[7];
+		info.addr[0] = 0;
+		info.addr[1] = (char)p[1];
+		info.addr[2] = (char)p[2];
+		info.addr[3] = (char)p[3];
+		snprintf(info.name, sizeof(info.name), "soc2_2_ram_%s_1_1_hdr.bin",
+			 conn_ram_patch[i]);
+
+		if (ioctl(fd, WMT_IOCTL_SET_ROM_PATCH_INFO, &info) < 0)
+			printf("  [conn] rom patch %s: %s\n", conn_ram_patch[i],
+			       strerror(errno));
+		else
+			ok++;
+	}
+	fflush(stdout);
+	return ok;
+}
+
+/*
+ * The kernel writes command words ("srh_rom_patch", "srh_patch", ...) and
+ * blocks until we answer, so this has to outlive everything else.
+ */
+static void conn_launcher(void)
+{
+	char cmd[256], cfg[256];
+	int fd, kfd, i;
+
+	kfd = open("/dev/kmsg", O_WRONLY);
+	fd = open("/dev/stpwmt", O_RDWR | O_NOCTTY);
+	if (fd < 0) {
+		if (kfd >= 0) {
+			char b[96];
+			int n = snprintf(b, sizeof(b),
+					 "evergo: conn launcher: /dev/stpwmt: %s\n",
+					 strerror(errno));
+
+			write(kfd, b, n);
+		}
+		_exit(1);
+	}
+
+	memset(cfg, 0, sizeof(cfg));
+	snprintf(cfg, sizeof(cfg), "WMT_SOC.cfg");
+	ioctl(fd, WMT_IOCTL_WMT_CFG_NAME, cfg);
+	/* STP_BTIF_FULL | WMT_FM_COM << 4 -- the value the Android launcher sets */
+	ioctl(fd, WMT_IOCTL_SET_STP_MODE, 0x23);
+	if (kfd >= 0)
+		write(kfd, "evergo: conn launcher up\n", 25);
+
+	for (i = 0;; i++) {
+		fd_set rfds;
+		struct timeval tv;
+		int r;
+
+		FD_ZERO(&rfds);
+		FD_SET(fd, &rfds);
+		tv.tv_sec = 5;
+		tv.tv_usec = 0;
+		r = select(fd + 1, &rfds, NULL, NULL, &tv);
+		if (r <= 0)
+			continue;
+
+		memset(cmd, 0, sizeof(cmd));
+		r = read(fd, cmd, sizeof(cmd) - 1);
+		if (r <= 0) {
+			usleep(100000);
+			continue;
+		}
+
+		if (!strcmp(cmd, "srh_rom_patch")) {
+			int n = wmt_rom_patch_info(fd, "/lib/firmware");
+
+			write(fd, n ? "ok" : "fail", n ? 2 : 4);
+		} else if (!strcmp(cmd, "srh_patch")) {
+			/* no separate patch file: the ROM patches carry it */
+			write(fd, "fail", 4);
+		} else {
+			write(fd, "ok", 2);
+		}
+	}
+}
+
+static void conn_bringup(void)
+{
+	int fd, chip;
+
+	printf("\n--- connectivity (WMT) bring-up ---\n");
+	fflush(stdout);
+
+	fd = open("/dev/wmtdetect", O_RDWR);
+	if (fd < 0) {
+		printf("  <no /dev/wmtdetect: %s>\n", strerror(errno));
+		fflush(stdout);
+		return;
+	}
+
+	/* CONN hardware init: MTCMOS, ADIE identify, ROM patches into EMI */
+	if (ioctl(fd, COMBO_IOCTL_CONNSYS_SOC_HW_INIT) < 0)
+		printf("  hwinit: %s\n", strerror(errno));
+	chip = ioctl(fd, COMBO_IOCTL_GET_SOC_CHIP_ID);
+	printf("  soc chip id: 0x%x\n", chip);
+	if (chip >= 0)
+		printf("  set chip: %d\n",
+		       ioctl(fd, COMBO_IOCTL_SET_CHIP_ID, chip));
+	/*
+	 * Do NOT issue COMBO_IOCTL_GET_ADIE_CHIP_ID here.  It runs the whole
+	 * A-die identification flow, which ends in polling_consys_chipid() ->
+	 * consys_dl_rom_patch() -> wmt_ctrl(), and wmt_ctrl()'s wake-up queue is
+	 * only valid once the WMT core is up.  Issuing it this early gave a NULL
+	 * dereference in __wake_up_common and killed init.
+	 * mtk_wcn_consys_hw_pwr_on() performs the same detection later, after the
+	 * core is initialised, which is the safe point for it.
+	 */
+	printf("  adie chip id: deferred to WMT core bring-up\n");
+	if (chip >= 0)
+		printf("  module init: %d\n",
+		       ioctl(fd, COMBO_IOCTL_DO_MODULE_INIT, chip));
+	close(fd);
+	fflush(stdout);
+
+	/* the responder must be alive before the WMT core asks for patches */
+	if (fork() == 0)
+		conn_launcher();	/* does not return */
+
+	usleep(300000);
+
+	/* /dev/wmtWifi is the gen4m power switch (adaptor/wmt_cdev_wifi.c) */
+	fd = open("/dev/wmtWifi", O_WRONLY);
+	if (fd < 0) {
+		printf("  <no /dev/wmtWifi: %s>\n", strerror(errno));
+	} else {
+		if (write(fd, "1", 1) < 0)
+			printf("  Wi-Fi power-on: %s\n", strerror(errno));
+		else
+			printf("  Wi-Fi power-on requested\n");
+		close(fd);
+	}
+	fflush(stdout);
+}
+
 static void poke_backlights(void)
 {
 	struct dirent *de;
@@ -2306,6 +2514,9 @@ int main(void)
 	dump_file("/proc/device-tree/chosen/linux,initrd-end",
 		  "chosen: linux,initrd-end", 1);
 	hw_diag_irq();
+	/* CONN has to be alive before rootfs hand-over: the firmware download
+	 * this triggers is what makes wlan0 exist at all. */
+	conn_bringup();
 	probe_block_devices();
 	fflush(stdout);
 
